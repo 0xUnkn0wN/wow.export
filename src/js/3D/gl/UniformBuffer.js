@@ -6,7 +6,7 @@
 
 class UniformBuffer {
 	/**
-	 * @param {GLContext} ctx
+	 * @param {GLContext|GPUContext} ctx
 	 * @param {number} size - buffer size in bytes
 	 * @param {number} [usage=gl.DYNAMIC_DRAW]
 	 */
@@ -14,23 +14,36 @@ class UniformBuffer {
 		this.ctx = ctx;
 		this.gl = ctx.gl;
 		this.size = size;
-		this.usage = usage ?? this.gl.DYNAMIC_DRAW;
-		this.buffer = this.gl.createBuffer();
 		this.data = new ArrayBuffer(size);
 		this.view = new DataView(this.data);
 		this.float_view = new Float32Array(this.data);
 		this.int_view = new Int32Array(this.data);
 		this.dirty = false;
 
-		// allocate gpu buffer
-		this.gl.bindBuffer(this.gl.UNIFORM_BUFFER, this.buffer);
-		this.gl.bufferData(this.gl.UNIFORM_BUFFER, size, this.usage);
+		if (ctx.is_webgpu) {
+			this.buffer = ctx.device.createBuffer({
+				size: Math.ceil(size / 16) * 16,
+				usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+			});
+			this._bind_group = null;
+			this._bind_group_layout = null;
+		} else {
+			this.usage = usage ?? this.gl.DYNAMIC_DRAW;
+			this.buffer = this.gl.createBuffer();
+
+			// allocate gpu buffer
+			this.gl.bindBuffer(this.gl.UNIFORM_BUFFER, this.buffer);
+			this.gl.bufferData(this.gl.UNIFORM_BUFFER, size, this.usage);
+		}
 	}
 
 	/**
 	 * @param {number} binding_point
 	 */
 	bind(binding_point) {
+		if (this.ctx.is_webgpu)
+			return; // bind groups handle this
+
 		this.gl.bindBufferBase(this.gl.UNIFORM_BUFFER, binding_point, this.buffer);
 	}
 
@@ -40,6 +53,9 @@ class UniformBuffer {
 	 * @param {number} size
 	 */
 	bind_range(binding_point, offset, size) {
+		if (this.ctx.is_webgpu)
+			return; // bind groups handle this
+
 		this.gl.bindBufferRange(this.gl.UNIFORM_BUFFER, binding_point, this.buffer, offset, size);
 	}
 
@@ -180,6 +196,12 @@ class UniformBuffer {
 		if (!this.dirty)
 			return;
 
+		if (this.ctx.is_webgpu) {
+			this.ctx.device.queue.writeBuffer(this.buffer, 0, this.data);
+			this.dirty = false;
+			return;
+		}
+
 		this.gl.bindBuffer(this.gl.UNIFORM_BUFFER, this.buffer);
 		this.gl.bufferSubData(this.gl.UNIFORM_BUFFER, 0, this.data);
 		this.dirty = false;
@@ -191,14 +213,45 @@ class UniformBuffer {
 	 * @param {number} size
 	 */
 	upload_range(offset, size) {
+		if (this.ctx.is_webgpu) {
+			this.ctx.device.queue.writeBuffer(this.buffer, offset, new Uint8Array(this.data, offset, size));
+			return;
+		}
+
 		this.gl.bindBuffer(this.gl.UNIFORM_BUFFER, this.buffer);
 		this.gl.bufferSubData(this.gl.UNIFORM_BUFFER, offset, new Uint8Array(this.data, offset, size));
 	}
 
+	/**
+	 * Get or create a bind group for this uniform buffer (WebGPU only).
+	 * @param {GPUBindGroupLayout} layout
+	 * @param {number} [binding=0]
+	 * @returns {GPUBindGroup}
+	 */
+	get_bind_group(layout, binding = 0) {
+		if (this._bind_group && this._bind_group_layout === layout)
+			return this._bind_group;
+
+		this._bind_group_layout = layout;
+		this._bind_group = this.ctx.device.createBindGroup({
+			layout,
+			entries: [{ binding, resource: { buffer: this.buffer } }]
+		});
+
+		return this._bind_group;
+	}
+
 	dispose() {
-		if (this.buffer) {
-			this.gl.deleteBuffer(this.buffer);
-			this.buffer = null;
+		if (this.ctx.is_webgpu) {
+			if (this.buffer) {
+				this.buffer.destroy();
+				this.buffer = null;
+			}
+		} else {
+			if (this.buffer) {
+				this.gl.deleteBuffer(this.buffer);
+				this.buffer = null;
+			}
 		}
 
 		this.data = null;

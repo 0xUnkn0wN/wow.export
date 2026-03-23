@@ -34,13 +34,45 @@ void main() {
 }
 `;
 
+const GRID_WGSL = `
+struct Uniforms {
+	view_matrix: mat4x4<f32>,
+	projection_matrix: mat4x4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+
+struct VertexInput {
+	@location(0) position: vec3<f32>,
+	@location(1) color: vec3<f32>,
+};
+
+struct VertexOutput {
+	@builtin(position) position: vec4<f32>,
+	@location(0) color: vec3<f32>,
+};
+
+@vertex
+fn vs_main(in: VertexInput) -> VertexOutput {
+	var out: VertexOutput;
+	out.position = u.projection_matrix * u.view_matrix * vec4<f32>(in.position, 1.0);
+	out.color = in.color;
+	return out;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+	return vec4<f32>(in.color, 1.0);
+}
+`;
+
 // grid colors (matching Three.js GridHelper defaults)
 const CENTER_COLOR = [0.34, 0.68, 0.89]; // 0x57afe2
 const LINE_COLOR = [0.5, 0.5, 0.5];       // 0x808080
 
 class GridRenderer {
 	/**
-	 * @param {GLContext} gl_context
+	 * @param {GLContext|GPUContext} gl_context
 	 * @param {number} size - total size of the grid
 	 * @param {number} divisions - number of divisions
 	 */
@@ -55,20 +87,32 @@ class GridRenderer {
 		this.vertex_buffer = null;
 		this.vertex_count = 0;
 
+		// WebGPU resources
+		this._gpu_vbo = null;
+		this._gpu_pipeline = null;
+
 		this._init();
 	}
 
 	_init() {
 		this._create_shader();
 		this._create_geometry();
+
+		if (this.ctx.is_webgpu)
+			this._create_gpu_pipeline();
 	}
 
 	_create_shader() {
-		this.shader = new ShaderProgram(this.ctx, GRID_VERT_SHADER, GRID_FRAG_SHADER);
+		if (this.ctx.is_webgpu) {
+			this.shader = new ShaderProgram(this.ctx, GRID_WGSL);
+			this.shader.define_uniform('u_view_matrix', 0, 64);
+			this.shader.define_uniform('u_projection_matrix', 64, 64);
+		} else {
+			this.shader = new ShaderProgram(this.ctx, GRID_VERT_SHADER, GRID_FRAG_SHADER);
+		}
 	}
 
 	_create_geometry() {
-		const gl = this.gl;
 		const half = this.size / 2;
 		const step = this.size / this.divisions;
 
@@ -90,25 +134,53 @@ class GridRenderer {
 		}
 
 		this.vertex_count = vertices.length / 6;
+		const vertex_data = new Float32Array(vertices);
 
-		// create VAO
-		this.vao = gl.createVertexArray();
-		gl.bindVertexArray(this.vao);
+		if (this.ctx.is_webgpu) {
+			const device = this.ctx.device;
+			this._gpu_vbo = device.createBuffer({
+				size: vertex_data.byteLength,
+				usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+				mappedAtCreation: true
+			});
+			new Float32Array(this._gpu_vbo.getMappedRange()).set(vertex_data);
+			this._gpu_vbo.unmap();
+		} else {
+			const gl = this.gl;
 
-		// create buffer
-		this.vertex_buffer = gl.createBuffer();
-		gl.bindBuffer(gl.ARRAY_BUFFER, this.vertex_buffer);
-		gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(vertices), gl.STATIC_DRAW);
+			// create VAO
+			this.vao = gl.createVertexArray();
+			gl.bindVertexArray(this.vao);
 
-		// position attribute (location 0)
-		gl.enableVertexAttribArray(0);
-		gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 24, 0);
+			// create buffer
+			this.vertex_buffer = gl.createBuffer();
+			gl.bindBuffer(gl.ARRAY_BUFFER, this.vertex_buffer);
+			gl.bufferData(gl.ARRAY_BUFFER, vertex_data, gl.STATIC_DRAW);
 
-		// color attribute (location 1)
-		gl.enableVertexAttribArray(1);
-		gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 24, 12);
+			// position attribute (location 0)
+			gl.enableVertexAttribArray(0);
+			gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 24, 0);
 
-		gl.bindVertexArray(null);
+			// color attribute (location 1)
+			gl.enableVertexAttribArray(1);
+			gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 24, 12);
+
+			gl.bindVertexArray(null);
+		}
+	}
+
+	_create_gpu_pipeline() {
+		this.shader.create_pipeline({
+			vertex_buffers: [{
+				arrayStride: 24,
+				attributes: [
+					{ shaderLocation: 0, offset: 0, format: 'float32x3' },
+					{ shaderLocation: 1, offset: 12, format: 'float32x3' }
+				]
+			}],
+			topology: 'line-list',
+			depth_stencil: this.ctx.get_depth_stencil_state()
+		});
 	}
 
 	/**
@@ -118,6 +190,11 @@ class GridRenderer {
 	render(view_matrix, projection_matrix) {
 		if (!this.shader || !this.shader.is_valid())
 			return;
+
+		if (this.ctx.is_webgpu) {
+			this._render_gpu(view_matrix, projection_matrix);
+			return;
+		}
 
 		const gl = this.gl;
 
@@ -129,7 +206,33 @@ class GridRenderer {
 		gl.drawArrays(gl.LINES, 0, this.vertex_count);
 	}
 
+	_render_gpu(view_matrix, projection_matrix) {
+		const pass = this.ctx.render_pass;
+		if (!pass || !this.shader.pipeline) return;
+
+		this.shader.set_uniform_mat4('u_view_matrix', false, view_matrix);
+		this.shader.set_uniform_mat4('u_projection_matrix', false, projection_matrix);
+		this.shader.flush_uniforms();
+
+		pass.setPipeline(this.shader.pipeline);
+		pass.setBindGroup(0, this.shader.uniform_bind_group);
+		pass.setVertexBuffer(0, this._gpu_vbo);
+		pass.draw(this.vertex_count, 1, 0, 0);
+	}
+
 	dispose() {
+		if (this.ctx.is_webgpu) {
+			if (this._gpu_vbo) {
+				this._gpu_vbo.destroy();
+				this._gpu_vbo = null;
+			}
+			if (this.shader) {
+				this.shader.dispose();
+				this.shader = null;
+			}
+			return;
+		}
+
 		const gl = this.gl;
 
 		if (this.vao) {

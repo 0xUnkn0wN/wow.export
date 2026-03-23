@@ -59,6 +59,7 @@
 	"creatureAutoPreview": true,
 	"exportCreatureFormat": "OBJ",
 	"exportLegacyModelFormat": "RAW",
+	"renderBackend": "webgpu",
 	"modelViewerShowGrid": true,
 	"modelViewerShowBackground": false,
 	"modelViewerBackgroundColor": "#000000",

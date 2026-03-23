@@ -5,7 +5,7 @@
 */
 
 const core = require('../core');
-const GLContext = require('../3D/gl/GLContext');
+const { create_render_context } = require('../3D/RenderContext');
 const CameraControlsGL = require('../3D/camera/CameraControlsGL');
 const CharacterCameraControlsGL = require('../3D/camera/CharacterCameraControlsGL');
 const GridRenderer = require('../3D/renderers/GridRenderer');
@@ -260,7 +260,12 @@ module.exports = {
 			} else {
 				this.gl_context.set_clear_color(0, 0, 0, 0);
 			}
-			this.gl_context.clear(true, true);
+
+			// WebGPU: begin frame (creates shared render pass)
+			if (this.gl_context.is_webgpu)
+				this.gl_context.begin_frame();
+			else
+				this.gl_context.clear(true, true);
 
 			// render shadow plane (before model, for character mode)
 			if (this.shadow_renderer && this.shadow_renderer.visible)
@@ -363,6 +368,10 @@ module.exports = {
 				}
 			}
 
+			// WebGPU: end frame (submits command buffer)
+			if (this.gl_context.is_webgpu)
+				this.gl_context.end_frame();
+
 			requestAnimationFrame(() => this.render());
 		},
 
@@ -422,7 +431,7 @@ module.exports = {
 		}
 	},
 
-	mounted: function() {
+	mounted: async function() {
 		const container = this.$el;
 
 		// create canvas
@@ -431,8 +440,8 @@ module.exports = {
 		container.appendChild(canvas);
 		this.canvas = canvas;
 
-		// create GL context
-		this.gl_context = new GLContext(canvas, {
+		// create render context (WebGL2 or WebGPU based on config)
+		this.gl_context = await create_render_context(canvas, {
 			antialias: true,
 			alpha: true,
 			preserveDrawingBuffer: true

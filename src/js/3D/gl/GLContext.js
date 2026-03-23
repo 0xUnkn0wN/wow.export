@@ -400,6 +400,14 @@ class GLContext {
 		this.gl.drawArrays(mode, first, count);
 	}
 
+	/**
+	 * Whether this context is a WebGPU context.
+	 * @returns {boolean}
+	 */
+	get is_webgpu() {
+		return false;
+	}
+
 	dispose() {
 		// context is automatically cleaned up when canvas is removed
 		this.gl = null;

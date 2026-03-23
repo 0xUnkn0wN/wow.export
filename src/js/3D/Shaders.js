@@ -11,19 +11,15 @@ const log = require('../log');
 const ShaderProgram = require('./gl/ShaderProgram');
 
 const SHADER_MANIFEST = {
-	m2: { vert: 'm2.vertex.shader', frag: 'm2.fragment.shader' },
-	wmo: { vert: 'wmo.vertex.shader', frag: 'wmo.fragment.shader' },
-	adt: { vert: 'adt.vertex.shader', frag: 'adt.fragment.shader' },
-	adt_old: { vert: 'adt.vertex.shader', frag: 'adt.fragment.old.shader' },
-	char: { vert: 'char.vertex.shader', frag: 'char.fragment.shader' }
+	m2: { vert: 'm2.vertex.shader', frag: 'm2.fragment.shader', wgsl: 'm2.wgsl' },
+	wmo: { vert: 'wmo.vertex.shader', frag: 'wmo.fragment.shader', wgsl: 'wmo.wgsl' },
+	adt: { vert: 'adt.vertex.shader', frag: 'adt.fragment.shader', wgsl: 'adt.wgsl' },
+	adt_old: { vert: 'adt.vertex.shader', frag: 'adt.fragment.old.shader', wgsl: 'adt_old.wgsl' },
+	char: { vert: 'char.vertex.shader', frag: 'char.fragment.shader', wgsl: 'char.wgsl' }
 };
 
 // cached shader source text
 const source_cache = new Map();
-
-// active shader programs grouped by shader name
-// Map<name, Set<ShaderProgram>>
-const active_programs = new Map();
 
 /**
  * Load shader source from disk (cached)
@@ -48,14 +44,56 @@ function get_source(name) {
 }
 
 /**
+ * Load WGSL shader source from disk (cached).
+ * Returns null if the WGSL file does not exist.
+ * @param {string} name
+ * @returns {string|null}
+ */
+function get_wgsl_source(name) {
+	const cache_key = name + '_wgsl';
+	if (source_cache.has(cache_key))
+		return source_cache.get(cache_key);
+
+	const manifest = SHADER_MANIFEST[name];
+	if (!manifest || !manifest.wgsl)
+		return null;
+
+	const shader_path = constants.SHADER_PATH;
+	const wgsl_path = path.join(shader_path, manifest.wgsl);
+
+	try {
+		const wgsl = fs.readFileSync(wgsl_path, 'utf8');
+		source_cache.set(cache_key, wgsl);
+		return wgsl;
+	} catch {
+		// WGSL file doesn't exist yet
+		return null;
+	}
+}
+
+// active shader programs grouped by shader name
+// Map<name, Set<ShaderProgram>>
+const active_programs = new Map();
+
+/**
  * Create and register a shader program
- * @param {GLContext} ctx
+ * @param {GLContext|GPUContext} ctx
  * @param {string} name
  * @returns {ShaderProgram}
  */
 function create_program(ctx, name) {
-	const sources = get_source(name);
-	const program = new ShaderProgram(ctx, sources.vert, sources.frag);
+	let program;
+
+	if (ctx.is_webgpu) {
+		const wgsl = get_wgsl_source(name);
+		if (!wgsl)
+			throw new Error(`No WGSL shader found for: ${name}. Create ${SHADER_MANIFEST[name]?.wgsl} in the shaders directory.`);
+
+		program = new ShaderProgram(ctx, wgsl);
+	} else {
+		const sources = get_source(name);
+		program = new ShaderProgram(ctx, sources.vert, sources.frag);
+	}
 
 	if (!program.is_valid())
 		throw new Error(`Failed to compile shader: ${name}`);
@@ -102,12 +140,19 @@ function reload_all() {
 			continue;
 
 		try {
-			const sources = get_source(name);
-
 			for (const program of programs) {
-				if (program.recompile(sources.vert, sources.frag)) {
-					success_count++;
+				let ok;
+				if (program.ctx.is_webgpu) {
+					const wgsl = get_wgsl_source(name);
+					ok = wgsl ? program.recompile(wgsl) : false;
 				} else {
+					const sources = get_source(name);
+					ok = program.recompile(sources.vert, sources.frag);
+				}
+
+				if (ok)
+					success_count++;
+				else {
 					fail_count++;
 					log.write(`Failed to recompile shader program: ${name}`);
 				}
@@ -146,6 +191,7 @@ function get_total_program_count() {
 module.exports = {
 	SHADER_MANIFEST,
 	get_source,
+	get_wgsl_source,
 	create_program,
 	unregister,
 	reload_all,

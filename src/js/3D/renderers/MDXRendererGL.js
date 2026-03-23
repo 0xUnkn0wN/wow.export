@@ -171,11 +171,74 @@ class MDXRendererGL {
 		return Shaders.create_program(ctx, 'm2');
 	}
 
+	_init_webgpu() {
+		const shader = this.shader;
+
+		shader.define_uniform('u_view_matrix', 0, 64);
+		shader.define_uniform('u_projection_matrix', 64, 64);
+		shader.define_uniform('u_model_matrix', 128, 64);
+		shader.define_uniform('u_view_up', 192, 16);
+		shader.define_uniform('u_time', 208, 4);
+		shader.define_uniform('u_bone_count', 212, 4);
+		shader.define_uniform('u_has_tex_matrix1', 216, 4);
+		shader.define_uniform('u_has_tex_matrix2', 220, 4);
+		shader.define_uniform('u_tex_matrix1', 224, 64);
+		shader.define_uniform('u_tex_matrix2', 288, 64);
+		shader.define_uniform('u_vertex_shader', 352, 4);
+		shader.define_uniform('u_pixel_shader', 356, 4);
+		shader.define_uniform('u_blend_mode', 360, 4);
+		shader.define_uniform('u_apply_lighting', 364, 4);
+		shader.define_uniform('u_mesh_color', 368, 16);
+		shader.define_uniform('u_tex_sample_alpha', 384, 16);
+		shader.define_uniform('u_alpha_test', 400, 4);
+		shader.define_uniform('u_wireframe', 404, 4);
+		shader.define_uniform('u_wireframe_color', 416, 16);
+		shader.define_uniform('u_ambient_color', 432, 16);
+		shader.define_uniform('u_diffuse_color', 448, 16);
+		shader.define_uniform('u_light_dir', 464, 16);
+		shader.define_uniform('u_bone_matrices', 480, 16384);
+
+		shader.create_texture_bind_group_layout(4);
+	}
+
+	_create_gpu_pipeline(vao) {
+		this.shader.create_pipeline({
+			vertex_buffers: vao.vertex_layouts,
+			topology: 'triangle-list',
+			blend: {
+				color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+				alpha: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' }
+			},
+			depth_stencil: {
+				format: 'depth24plus-stencil8',
+				depthWriteEnabled: true,
+				depthCompare: 'less-equal'
+			},
+			cull_mode: 'none'
+		});
+	}
+
+	_create_gpu_buffer(data, usage) {
+		const device = this.ctx.device;
+		const aligned_size = Math.ceil(data.byteLength / 4) * 4;
+		const buffer = device.createBuffer({
+			size: aligned_size,
+			usage: usage,
+			mappedAtCreation: true
+		});
+		new Uint8Array(buffer.getMappedRange()).set(new Uint8Array(data.buffer || data, data.byteOffset || 0, data.byteLength));
+		buffer.unmap();
+		return buffer;
+	}
+
 	async load() {
 		this.mdx = new MDXLoader(this.data);
 		await this.mdx.load();
 
 		this.shader = MDXRendererGL.load_shaders(this.ctx);
+
+		if (this.ctx.is_webgpu)
+			this._init_webgpu();
 
 		this._create_default_texture();
 		await this._load_textures();
@@ -303,28 +366,6 @@ class MDXRendererGL {
 				flippedUvs[i * 2 + 1] = 1 - uvs[i * 2 + 1];
 			}
 
-			// create VAO
-			const vao = new VertexArray(this.ctx);
-			vao.bind();
-
-			// vertex buffer
-			const vbo = gl.createBuffer();
-			gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
-			gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
-			this.buffers.push(vbo);
-
-			// normal buffer
-			const nbo = gl.createBuffer();
-			gl.bindBuffer(gl.ARRAY_BUFFER, nbo);
-			gl.bufferData(gl.ARRAY_BUFFER, normals, gl.STATIC_DRAW);
-			this.buffers.push(nbo);
-
-			// uv buffer
-			const uvo = gl.createBuffer();
-			gl.bindBuffer(gl.ARRAY_BUFFER, uvo);
-			gl.bufferData(gl.ARRAY_BUFFER, flippedUvs, gl.STATIC_DRAW);
-			this.buffers.push(uvo);
-
 			// bone index/weight (mdx uses group-based skinning, simplified for now)
 			const boneIndices = new Uint8Array(vertCount * 4);
 			const boneWeights = new Uint8Array(vertCount * 4);
@@ -333,7 +374,6 @@ class MDXRendererGL {
 				const groupIdx = geoset.vertexGroup[i] || 0;
 				const group = geoset.groups[groupIdx] || [0];
 
-				// assign up to 4 bones per vertex with equal weight
 				const boneCount = Math.min(group.length, 4);
 				const weight = Math.floor(255 / boneCount);
 
@@ -348,24 +388,58 @@ class MDXRendererGL {
 				}
 			}
 
-			const bibo = gl.createBuffer();
-			gl.bindBuffer(gl.ARRAY_BUFFER, bibo);
-			gl.bufferData(gl.ARRAY_BUFFER, boneIndices, gl.STATIC_DRAW);
-			this.buffers.push(bibo);
+			// create VAO
+			const vao = new VertexArray(this.ctx);
+			const is_webgpu = this.ctx.is_webgpu;
 
-			const bwbo = gl.createBuffer();
-			gl.bindBuffer(gl.ARRAY_BUFFER, bwbo);
-			gl.bufferData(gl.ARRAY_BUFFER, boneWeights, gl.STATIC_DRAW);
-			this.buffers.push(bwbo);
+			if (is_webgpu) {
+				const vbo = this._create_gpu_buffer(vertices, GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST);
+				const nbo = this._create_gpu_buffer(normals, GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST);
+				const uvo = this._create_gpu_buffer(flippedUvs, GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST);
+				const bibo = this._create_gpu_buffer(boneIndices, GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST);
+				const bwbo = this._create_gpu_buffer(boneWeights, GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST);
 
-			// index buffer
-			const ebo = gl.createBuffer();
-			gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo);
-			gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(geoset.faces), gl.STATIC_DRAW);
-			this.buffers.push(ebo);
-			vao.ebo = ebo;
+				vao.set_index_buffer(new Uint16Array(geoset.faces));
+				vao.setup_m2_separate_buffers(vbo, nbo, uvo, bibo, bwbo, null);
 
-			vao.setup_m2_separate_buffers(vbo, nbo, uvo, bibo, bwbo, null);
+				if (!this.shader.pipeline)
+					this._create_gpu_pipeline(vao);
+			} else {
+				vao.bind();
+
+				const vbo = gl.createBuffer();
+				gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+				gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+				this.buffers.push(vbo);
+
+				const nbo = gl.createBuffer();
+				gl.bindBuffer(gl.ARRAY_BUFFER, nbo);
+				gl.bufferData(gl.ARRAY_BUFFER, normals, gl.STATIC_DRAW);
+				this.buffers.push(nbo);
+
+				const uvo = gl.createBuffer();
+				gl.bindBuffer(gl.ARRAY_BUFFER, uvo);
+				gl.bufferData(gl.ARRAY_BUFFER, flippedUvs, gl.STATIC_DRAW);
+				this.buffers.push(uvo);
+
+				const bibo = gl.createBuffer();
+				gl.bindBuffer(gl.ARRAY_BUFFER, bibo);
+				gl.bufferData(gl.ARRAY_BUFFER, boneIndices, gl.STATIC_DRAW);
+				this.buffers.push(bibo);
+
+				const bwbo = gl.createBuffer();
+				gl.bindBuffer(gl.ARRAY_BUFFER, bwbo);
+				gl.bufferData(gl.ARRAY_BUFFER, boneWeights, gl.STATIC_DRAW);
+				this.buffers.push(bwbo);
+
+				const ebo = gl.createBuffer();
+				gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo);
+				gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(geoset.faces), gl.STATIC_DRAW);
+				this.buffers.push(ebo);
+				vao.ebo = ebo;
+
+				vao.setup_m2_separate_buffers(vbo, nbo, uvo, bibo, bwbo, null);
+			}
 
 			this.vaos.push(vao);
 
@@ -671,6 +745,7 @@ class MDXRendererGL {
 		const ctx = this.ctx;
 		const shader = this.shader;
 		const wireframe = core.view.config.modelViewerWireframe;
+		const is_webgpu = ctx.is_webgpu;
 
 		shader.use();
 
@@ -683,9 +758,13 @@ class MDXRendererGL {
 		// bone matrices (mdx uses node-based skeleton)
 		shader.set_uniform_1i('u_bone_count', this.nodes ? this.nodes.length : 0);
 		if (this.nodes && this.node_matrices) {
-			const loc = shader.get_uniform_location('u_bone_matrices');
-			if (loc !== null)
-				gl.uniformMatrix4fv(loc, false, this.node_matrices);
+			if (is_webgpu) {
+				shader.set_uniform_mat4_array('u_bone_matrices', this.node_matrices);
+			} else {
+				const loc = shader.get_uniform_location('u_bone_matrices');
+				if (loc !== null)
+					gl.uniformMatrix4fv(loc, false, this.node_matrices);
+			}
 		}
 
 		shader.set_uniform_1i('u_has_tex_matrix1', 0);
@@ -708,12 +787,6 @@ class MDXRendererGL {
 		shader.set_uniform_4f('u_wireframe_color', 1, 1, 1, 1);
 
 		shader.set_uniform_1f('u_alpha_test', 0.501960814);
-
-		shader.set_uniform_1i('u_texture1', 0);
-		shader.set_uniform_1i('u_texture2', 1);
-		shader.set_uniform_1i('u_texture3', 2);
-		shader.set_uniform_1i('u_texture4', 3);
-
 		shader.set_uniform_3f('u_tex_sample_alpha', 1, 1, 1);
 
 		// use basic shader mode for mdx
@@ -721,44 +794,78 @@ class MDXRendererGL {
 		shader.set_uniform_1i('u_pixel_shader', 0);
 		shader.set_uniform_4f('u_mesh_color', 1, 1, 1, 1);
 
-		ctx.set_depth_test(true);
-		ctx.set_depth_write(true);
+		if (is_webgpu) {
+			const pass = ctx.render_pass;
+			if (!pass || !shader.pipeline)
+				return;
 
-		for (const dc of this.draw_calls) {
-			if (!dc.visible)
-				continue;
+			pass.setPipeline(shader.pipeline);
 
-			// map mdx blend modes to m2 blend modes
-			shader.set_uniform_1i('u_blend_mode', dc.blendMode);
-			ctx.apply_blend_mode(dc.blendMode);
+			for (const dc of this.draw_calls) {
+				if (!dc.visible)
+					continue;
 
-			if (dc.twoSided)
-				ctx.set_cull_face(false);
-			else {
-				ctx.set_cull_face(true);
-				ctx.set_cull_mode(gl.BACK);
+				shader.set_uniform_1i('u_blend_mode', dc.blendMode);
+
+				shader.flush_uniforms();
+				pass.setBindGroup(0, shader.uniform_bind_group);
+
+				const texture = (dc.textureId !== null) ? (this.textures.get(dc.textureId) || this.default_texture) : this.default_texture;
+				const tex_objs = [texture, this.default_texture, this.default_texture, this.default_texture];
+
+				try {
+					const tex_bind_group = shader.create_texture_bind_group(tex_objs);
+					pass.setBindGroup(1, tex_bind_group);
+				} catch (e) {
+					continue;
+				}
+
+				dc.vao.bind_to_pass(pass);
+				pass.drawIndexed(dc.count, 1, dc.start, 0, 0);
+			}
+		} else {
+			shader.set_uniform_1i('u_texture1', 0);
+			shader.set_uniform_1i('u_texture2', 1);
+			shader.set_uniform_1i('u_texture3', 2);
+			shader.set_uniform_1i('u_texture4', 3);
+
+			ctx.set_depth_test(true);
+			ctx.set_depth_write(true);
+
+			for (const dc of this.draw_calls) {
+				if (!dc.visible)
+					continue;
+
+				shader.set_uniform_1i('u_blend_mode', dc.blendMode);
+				ctx.apply_blend_mode(dc.blendMode);
+
+				if (dc.twoSided)
+					ctx.set_cull_face(false);
+				else {
+					ctx.set_cull_face(true);
+					ctx.set_cull_mode(gl.BACK);
+				}
+
+				const texture = (dc.textureId !== null) ? (this.textures.get(dc.textureId) || this.default_texture) : this.default_texture;
+				texture.bind(0);
+				this.default_texture.bind(1);
+				this.default_texture.bind(2);
+				this.default_texture.bind(3);
+
+				dc.vao.bind();
+				gl.drawElements(
+					wireframe ? gl.LINES : gl.TRIANGLES,
+					dc.count,
+					gl.UNSIGNED_SHORT,
+					dc.start * 2
+				);
 			}
 
-			// bind texture
-			const texture = (dc.textureId !== null) ? (this.textures.get(dc.textureId) || this.default_texture) : this.default_texture;
-			texture.bind(0);
-			this.default_texture.bind(1);
-			this.default_texture.bind(2);
-			this.default_texture.bind(3);
-
-			dc.vao.bind();
-			gl.drawElements(
-				wireframe ? gl.LINES : gl.TRIANGLES,
-				dc.count,
-				gl.UNSIGNED_SHORT,
-				dc.start * 2
-			);
+			ctx.set_blend(false);
+			ctx.set_depth_test(true);
+			ctx.set_depth_write(true);
+			ctx.set_cull_face(false);
 		}
-
-		ctx.set_blend(false);
-		ctx.set_depth_test(true);
-		ctx.set_depth_write(true);
-		ctx.set_cull_face(false);
 	}
 
 	getBoundingBox() {

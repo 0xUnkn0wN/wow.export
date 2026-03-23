@@ -74,11 +74,64 @@ class WMOLegacyRendererGL {
 		return Shaders.create_program(ctx, 'wmo');
 	}
 
+	_init_webgpu() {
+		const shader = this.shader;
+
+		shader.define_uniform('u_view_matrix', 0, 64);
+		shader.define_uniform('u_projection_matrix', 64, 64);
+		shader.define_uniform('u_model_matrix', 128, 64);
+		shader.define_uniform('u_vertex_shader', 192, 4);
+		shader.define_uniform('u_pixel_shader', 196, 4);
+		shader.define_uniform('u_blend_mode', 200, 4);
+		shader.define_uniform('u_use_vertex_color', 204, 4);
+		shader.define_uniform('u_apply_lighting', 208, 4);
+		shader.define_uniform('u_wireframe', 212, 4);
+		shader.define_uniform('u_ambient_color', 224, 16);
+		shader.define_uniform('u_diffuse_color', 240, 16);
+		shader.define_uniform('u_light_dir', 256, 16);
+		shader.define_uniform('u_wireframe_color', 272, 16);
+
+		shader.create_texture_bind_group_layout(9);
+	}
+
+	_create_gpu_pipeline(vao) {
+		this.shader.create_pipeline({
+			vertex_buffers: vao.vertex_layouts,
+			topology: 'triangle-list',
+			blend: {
+				color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+				alpha: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' }
+			},
+			depth_stencil: {
+				format: 'depth24plus-stencil8',
+				depthWriteEnabled: true,
+				depthCompare: 'less-equal'
+			},
+			cull_mode: 'none'
+		});
+	}
+
+	_create_gpu_buffer(data) {
+		const device = this.ctx.device;
+		const aligned_size = Math.ceil(data.byteLength / 4) * 4;
+		const buffer = device.createBuffer({
+			size: aligned_size,
+			usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+			mappedAtCreation: true
+		});
+		new Uint8Array(buffer.getMappedRange()).set(new Uint8Array(data.buffer || data, data.byteOffset || 0, data.byteLength));
+		buffer.unmap();
+		return buffer;
+	}
+
 	async load() {
 		this.wmo = new WMOLegacyLoader(this.data, this.fileID, true);
 		await this.wmo.load();
 
 		this.shader = WMOLegacyRendererGL.load_shaders(this.ctx);
+
+		if (this.ctx.is_webgpu)
+			this._init_webgpu();
 
 		this._create_default_texture();
 		await this._load_textures();
@@ -168,6 +221,8 @@ class WMOLegacyRendererGL {
 	async _load_groups() {
 		const wmo = this.wmo;
 		const gl = this.gl;
+		const is_webgpu = this.ctx.is_webgpu;
+		let pipeline_created = false;
 
 		for (let i = 0; i < wmo.groupCount; i++) {
 			try {
@@ -177,45 +232,59 @@ class WMOLegacyRendererGL {
 					continue;
 
 				const vao = new VertexArray(this.ctx);
-				vao.bind();
 
-				// vertex buffer
-				const vbo = gl.createBuffer();
-				gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
-				gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(group.vertices), gl.STATIC_DRAW);
-				this.buffers.push(vbo);
+				let vbo = null, nbo = null, uvo = null, cbo = null;
 
-				// normal buffer
-				const nbo = gl.createBuffer();
-				gl.bindBuffer(gl.ARRAY_BUFFER, nbo);
-				gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(group.normals), gl.STATIC_DRAW);
-				this.buffers.push(nbo);
+				if (is_webgpu) {
+					vbo = this._create_gpu_buffer(new Float32Array(group.vertices));
+					nbo = this._create_gpu_buffer(new Float32Array(group.normals));
 
-				// UV buffer
-				let uvo = null;
-				if (group.uvs && group.uvs[0]) {
-					uvo = gl.createBuffer();
-					gl.bindBuffer(gl.ARRAY_BUFFER, uvo);
-					gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(group.uvs[0]), gl.STATIC_DRAW);
-					this.buffers.push(uvo);
+					if (group.uvs && group.uvs[0])
+						uvo = this._create_gpu_buffer(new Float32Array(group.uvs[0]));
+
+					if (group.vertexColours && group.vertexColours[0])
+						cbo = this._create_gpu_buffer(new Uint8Array(group.vertexColours[0]));
+
+					vao.set_index_buffer(new Uint16Array(group.indices));
+				} else {
+					vao.bind();
+
+					vbo = gl.createBuffer();
+					gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+					gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(group.vertices), gl.STATIC_DRAW);
+					this.buffers.push(vbo);
+
+					nbo = gl.createBuffer();
+					gl.bindBuffer(gl.ARRAY_BUFFER, nbo);
+					gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(group.normals), gl.STATIC_DRAW);
+					this.buffers.push(nbo);
+
+					if (group.uvs && group.uvs[0]) {
+						uvo = gl.createBuffer();
+						gl.bindBuffer(gl.ARRAY_BUFFER, uvo);
+						gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(group.uvs[0]), gl.STATIC_DRAW);
+						this.buffers.push(uvo);
+					}
+
+					if (group.vertexColours && group.vertexColours[0]) {
+						cbo = gl.createBuffer();
+						gl.bindBuffer(gl.ARRAY_BUFFER, cbo);
+						gl.bufferData(gl.ARRAY_BUFFER, new Uint8Array(group.vertexColours[0]), gl.STATIC_DRAW);
+						this.buffers.push(cbo);
+					}
+
+					const ebo = gl.createBuffer();
+					gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo);
+					gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(group.indices), gl.STATIC_DRAW);
+					vao.ebo = ebo;
 				}
-
-				// color buffer
-				let cbo = null;
-				if (group.vertexColours && group.vertexColours[0]) {
-					cbo = gl.createBuffer();
-					gl.bindBuffer(gl.ARRAY_BUFFER, cbo);
-					gl.bufferData(gl.ARRAY_BUFFER, new Uint8Array(group.vertexColours[0]), gl.STATIC_DRAW);
-					this.buffers.push(cbo);
-				}
-
-				// index buffer
-				const ebo = gl.createBuffer();
-				gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo);
-				gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(group.indices), gl.STATIC_DRAW);
-				vao.ebo = ebo;
 
 				vao.setup_wmo_separate_buffers(vbo, nbo, uvo, cbo, null, null, null, null, null);
+
+				if (is_webgpu && !pipeline_created) {
+					this._create_gpu_pipeline(vao);
+					pipeline_created = true;
+				}
 
 				// build draw calls
 				const draw_calls = [];
@@ -412,6 +481,14 @@ class WMOLegacyRendererGL {
 		const ctx = this.ctx;
 		const shader = this.shader;
 		const wireframe = core.view.config.modelViewerWireframe;
+		const is_webgpu = ctx.is_webgpu;
+
+		let pass;
+		if (is_webgpu) {
+			pass = ctx.render_pass;
+			if (!pass)
+				return;
+		}
 
 		shader.use();
 
@@ -435,45 +512,84 @@ class WMOLegacyRendererGL {
 
 		shader.set_uniform_1i('u_use_vertex_color', 0);
 
-		shader.set_uniform_1i('u_texture1', 0);
-		shader.set_uniform_1i('u_texture2', 1);
-		shader.set_uniform_1i('u_texture3', 2);
-		shader.set_uniform_1i('u_texture4', 3);
-		shader.set_uniform_1i('u_texture5', 4);
-		shader.set_uniform_1i('u_texture6', 5);
-		shader.set_uniform_1i('u_texture7', 6);
-		shader.set_uniform_1i('u_texture8', 7);
-		shader.set_uniform_1i('u_texture9', 8);
+		if (is_webgpu) {
+			if (!shader.pipeline)
+				return;
 
-		ctx.set_depth_test(true);
-		ctx.set_depth_write(true);
-		ctx.set_cull_face(false);
-		ctx.set_blend(false);
+			pass.setPipeline(shader.pipeline);
 
-		for (const group of this.groups) {
-			if (!group.visible)
-				continue;
+			for (const group of this.groups) {
+				if (!group.visible)
+					continue;
 
-			group.vao.bind();
+				group.vao.bind_to_pass(pass);
 
-			for (const dc of group.draw_calls) {
-				shader.set_uniform_1i('u_vertex_shader', dc.shader.VertexShader);
-				shader.set_uniform_1i('u_pixel_shader', dc.shader.PixelShader);
-				shader.set_uniform_1i('u_blend_mode', dc.blendMode);
+				for (const dc of group.draw_calls) {
+					shader.set_uniform_1i('u_vertex_shader', dc.shader.VertexShader);
+					shader.set_uniform_1i('u_pixel_shader', dc.shader.PixelShader);
+					shader.set_uniform_1i('u_blend_mode', dc.blendMode);
 
-				const textureFileNames = this.materialTextures.get(dc.material_id);
-				for (let i = 0; i < 9; i++) {
-					const textureName = textureFileNames?.[i] || null;
-					const texture = textureName ? (this.textures.get(textureName) || this.default_texture) : this.default_texture;
-					texture.bind(i);
+					shader.flush_uniforms();
+					pass.setBindGroup(0, shader.uniform_bind_group);
+
+					const tex_objs = [];
+					const textureFileNames = this.materialTextures.get(dc.material_id);
+					for (let i = 0; i < 9; i++) {
+						const textureName = textureFileNames?.[i] || null;
+						tex_objs.push(textureName ? (this.textures.get(textureName) || this.default_texture) : this.default_texture);
+					}
+
+					try {
+						const tex_bind_group = shader.create_texture_bind_group(tex_objs);
+						pass.setBindGroup(1, tex_bind_group);
+					} catch (e) {
+						continue;
+					}
+
+					pass.drawIndexed(dc.count, 1, dc.start, 0, 0);
 				}
+			}
+		} else {
+			shader.set_uniform_1i('u_texture1', 0);
+			shader.set_uniform_1i('u_texture2', 1);
+			shader.set_uniform_1i('u_texture3', 2);
+			shader.set_uniform_1i('u_texture4', 3);
+			shader.set_uniform_1i('u_texture5', 4);
+			shader.set_uniform_1i('u_texture6', 5);
+			shader.set_uniform_1i('u_texture7', 6);
+			shader.set_uniform_1i('u_texture8', 7);
+			shader.set_uniform_1i('u_texture9', 8);
 
-				gl.drawElements(
-					wireframe ? gl.LINES : gl.TRIANGLES,
-					dc.count,
-					gl.UNSIGNED_SHORT,
-					dc.start * 2
-				);
+			ctx.set_depth_test(true);
+			ctx.set_depth_write(true);
+			ctx.set_cull_face(false);
+			ctx.set_blend(false);
+
+			for (const group of this.groups) {
+				if (!group.visible)
+					continue;
+
+				group.vao.bind();
+
+				for (const dc of group.draw_calls) {
+					shader.set_uniform_1i('u_vertex_shader', dc.shader.VertexShader);
+					shader.set_uniform_1i('u_pixel_shader', dc.shader.PixelShader);
+					shader.set_uniform_1i('u_blend_mode', dc.blendMode);
+
+					const textureFileNames = this.materialTextures.get(dc.material_id);
+					for (let i = 0; i < 9; i++) {
+						const textureName = textureFileNames?.[i] || null;
+						const texture = textureName ? (this.textures.get(textureName) || this.default_texture) : this.default_texture;
+						texture.bind(i);
+					}
+
+					gl.drawElements(
+						wireframe ? gl.LINES : gl.TRIANGLES,
+						dc.count,
+						gl.UNSIGNED_SHORT,
+						dc.start * 2
+					);
+				}
 			}
 		}
 

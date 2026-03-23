@@ -367,6 +367,10 @@ class M2RendererGL {
 		// load shader program
 		this.shader = M2RendererGL.load_shaders(this.ctx);
 
+		// WebGPU: define explicit uniform layout matching m2.wgsl struct
+		if (this.ctx.is_webgpu)
+			this._init_webgpu();
+
 		// create default texture
 		this._create_default_texture();
 
@@ -386,6 +390,64 @@ class M2RendererGL {
 
 		// drop reference to raw data
 		this.data = undefined;
+	}
+
+	/**
+	 * Initialize WebGPU-specific resources: explicit uniform layout, texture bind groups, pipeline.
+	 */
+	_init_webgpu() {
+		const shader = this.shader;
+
+		// Define uniforms matching the WGSL Uniforms struct layout exactly.
+		// Each offset must match the WGSL struct member alignment.
+		shader.define_uniform('u_view_matrix', 0, 64);           // mat4x4<f32>
+		shader.define_uniform('u_projection_matrix', 64, 64);    // mat4x4<f32>
+		shader.define_uniform('u_model_matrix', 128, 64);        // mat4x4<f32>
+		shader.define_uniform('u_view_up', 192, 16);             // vec4<f32> (3f writes first 12 bytes, w=0)
+		shader.define_uniform('u_time', 208, 4);                 // f32
+		shader.define_uniform('u_bone_count', 212, 4);           // i32
+		shader.define_uniform('u_has_tex_matrix1', 216, 4);      // i32
+		shader.define_uniform('u_has_tex_matrix2', 220, 4);      // i32
+		shader.define_uniform('u_tex_matrix1', 224, 64);         // mat4x4<f32>
+		shader.define_uniform('u_tex_matrix2', 288, 64);         // mat4x4<f32>
+		shader.define_uniform('u_vertex_shader', 352, 4);        // i32
+		shader.define_uniform('u_pixel_shader', 356, 4);         // i32
+		shader.define_uniform('u_blend_mode', 360, 4);           // i32
+		shader.define_uniform('u_apply_lighting', 364, 4);       // i32
+		shader.define_uniform('u_mesh_color', 368, 16);          // vec4<f32>
+		shader.define_uniform('u_tex_sample_alpha', 384, 16);    // vec4<f32>
+		shader.define_uniform('u_alpha_test', 400, 4);           // f32
+		shader.define_uniform('u_wireframe', 404, 4);            // i32
+		// _pad0 at 408, _pad1 at 412 (padding, not set)
+		shader.define_uniform('u_wireframe_color', 416, 16);     // vec4<f32>
+		shader.define_uniform('u_ambient_color', 432, 16);       // vec4<f32>
+		shader.define_uniform('u_diffuse_color', 448, 16);       // vec4<f32>
+		shader.define_uniform('u_light_dir', 464, 16);           // vec4<f32>
+		shader.define_uniform('u_bone_matrices', 480, 16384);    // array<mat4x4<f32>, 256>
+
+		// Create texture bind group layout (4 texture+sampler pairs)
+		shader.create_texture_bind_group_layout(4);
+	}
+
+	/**
+	 * Create the WebGPU render pipeline for M2.
+	 * @param {VertexArray} vao
+	 */
+	_create_gpu_pipeline(vao) {
+		this.shader.create_pipeline({
+			vertex_buffers: vao.vertex_layouts,
+			topology: 'triangle-list',
+			blend: {
+				color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+				alpha: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' }
+			},
+			depth_stencil: {
+				format: 'depth24plus-stencil8',
+				depthWriteEnabled: true,
+				depthCompare: 'less-equal'
+			},
+			cull_mode: 'none'
+		});
 	}
 
 	_create_default_texture() {
@@ -487,22 +549,33 @@ class M2RendererGL {
 
 		// create VAO
 		const vao = new VertexArray(this.ctx);
-		vao.bind();
 
-		const vbo = gl.createBuffer();
-		gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
-		gl.bufferData(gl.ARRAY_BUFFER, vertex_data, gl.STATIC_DRAW);
-		this.buffers.push(vbo);
-		vao.vbo = vbo;
+		if (this.ctx.is_webgpu) {
+			// WebGPU: create GPU buffers via VertexArray
+			vao.set_vertex_buffer(new Uint8Array(vertex_data));
+			vao.set_index_buffer(index_data);
+			vao.setup_m2_vertex_format();
 
-		const ebo = gl.createBuffer();
-		gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo);
-		gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, index_data, gl.STATIC_DRAW);
-		this.buffers.push(ebo);
-		vao.ebo = ebo;
+			// create pipeline now that we have vertex layout
+			this._create_gpu_pipeline(vao);
+		} else {
+			vao.bind();
 
-		// set up vertex attributes
-		vao.setup_m2_vertex_format();
+			const vbo = gl.createBuffer();
+			gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+			gl.bufferData(gl.ARRAY_BUFFER, vertex_data, gl.STATIC_DRAW);
+			this.buffers.push(vbo);
+			vao.vbo = vbo;
+
+			const ebo = gl.createBuffer();
+			gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo);
+			gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, index_data, gl.STATIC_DRAW);
+			this.buffers.push(ebo);
+			vao.ebo = ebo;
+
+			// set up vertex attributes
+			vao.setup_m2_vertex_format();
+		}
 
 		this.vaos.push(vao);
 
@@ -1213,6 +1286,14 @@ class M2RendererGL {
 		const ctx = this.ctx;
 		const shader = this.shader;
 		const wireframe = core.view.config.modelViewerWireframe;
+		const is_webgpu = ctx.is_webgpu;
+
+		let pass;
+		if (is_webgpu) {
+			pass = ctx.render_pass;
+			if (!pass || !shader.pipeline)
+				return;
+		}
 
 		shader.use();
 
@@ -1226,9 +1307,13 @@ class M2RendererGL {
 		// bone matrices
 		shader.set_uniform_1i('u_bone_count', this.bones ? this.bones.length : 0);
 		if (this.bones && this.bone_matrices) {
-			const loc = shader.get_uniform_location('u_bone_matrices');
-			if (loc !== null)
-				gl.uniformMatrix4fv(loc, false, this.bone_matrices);
+			if (is_webgpu) {
+				shader.set_uniform_mat4_array('u_bone_matrices', false, this.bone_matrices);
+			} else {
+				const loc = shader.get_uniform_location('u_bone_matrices');
+				if (loc !== null)
+					gl.uniformMatrix4fv(loc, false, this.bone_matrices);
+			}
 		}
 
 		// texture matrix defaults
@@ -1255,77 +1340,132 @@ class M2RendererGL {
 		// alpha test
 		shader.set_uniform_1f('u_alpha_test', 0.501960814);
 
-		// texture samplers
-		shader.set_uniform_1i('u_texture1', 0);
-		shader.set_uniform_1i('u_texture2', 1);
-		shader.set_uniform_1i('u_texture3', 2);
-		shader.set_uniform_1i('u_texture4', 3);
+		// texture samplers (WebGL only - WebGPU uses bind groups)
+		if (!is_webgpu) {
+			shader.set_uniform_1i('u_texture1', 0);
+			shader.set_uniform_1i('u_texture2', 1);
+			shader.set_uniform_1i('u_texture3', 2);
+			shader.set_uniform_1i('u_texture4', 3);
+		}
 
 		// default texture weights
 		shader.set_uniform_3f('u_tex_sample_alpha', 1, 1, 1);
 
-		// sort draw calls by blend mode (opaque first, then transparent)
-		const sorted_calls = [...this.draw_calls].sort((a, b) => {
-			const a_opaque = a.blend_mode === 0 || a.blend_mode === 1;
-			const b_opaque = b.blend_mode === 0 || b.blend_mode === 1;
-			if (a_opaque !== b_opaque)
-				return a_opaque ? -1 : 1;
+		// render state (blend/cull/depth are pipeline state in WebGPU)
+		if (!is_webgpu) {
+			// sort draw calls by blend mode (opaque first, then transparent)
+			const sorted_calls = [...this.draw_calls].sort((a, b) => {
+				const a_opaque = a.blend_mode === 0 || a.blend_mode === 1;
+				const b_opaque = b.blend_mode === 0 || b.blend_mode === 1;
+				if (a_opaque !== b_opaque)
+					return a_opaque ? -1 : 1;
 
-			return 0;
-		});
+				return 0;
+			});
 
-		// render each draw call
-		for (const dc of sorted_calls) {
-			if (!dc.visible)
-				continue;
+			// render each draw call (WebGL path)
+			for (const dc of sorted_calls) {
+				if (!dc.visible)
+					continue;
 
-			// set material uniforms
-			shader.set_uniform_1i('u_vertex_shader', dc.vertex_shader);
-			shader.set_uniform_1i('u_pixel_shader', dc.pixel_shader);
-			shader.set_uniform_1i('u_blend_mode', dc.blend_mode);
+				// set material uniforms
+				shader.set_uniform_1i('u_vertex_shader', dc.vertex_shader);
+				shader.set_uniform_1i('u_pixel_shader', dc.pixel_shader);
+				shader.set_uniform_1i('u_blend_mode', dc.blend_mode);
 
-			// mesh color (white for now)
-			shader.set_uniform_4f('u_mesh_color', 1, 1, 1, 1);
+				// mesh color (white for now)
+				shader.set_uniform_4f('u_mesh_color', 1, 1, 1, 1);
 
-			// apply blend mode
-			ctx.apply_blend_mode(dc.blend_mode);
+				// apply blend mode
+				ctx.apply_blend_mode(dc.blend_mode);
 
-			// culling based on flags
-			if (dc.flags & 0x04) {
-				ctx.set_cull_face(false);
-			} else {
-				ctx.set_cull_face(true);
-				ctx.set_cull_mode(gl.BACK);
+				// culling based on flags
+				if (dc.flags & 0x04) {
+					ctx.set_cull_face(false);
+				} else {
+					ctx.set_cull_face(true);
+					ctx.set_cull_mode(gl.BACK);
+				}
+
+				// depth test flags
+				if (dc.flags & 0x08)
+					ctx.set_depth_test(false);
+				else
+					ctx.set_depth_test(true);
+
+				// bind textures (up to 4 for multi-texture shaders)
+				for (let t = 0; t < 4; t++) {
+					const tex_idx = dc.tex_indices[t];
+					const texture = (tex_idx !== null) ? (this.textures.get(tex_idx) || this.default_texture) : this.default_texture;
+					texture.bind(t);
+				}
+
+				// draw
+				dc.vao.bind();
+				gl.drawElements(
+					wireframe ? gl.LINES : gl.TRIANGLES,
+					dc.count,
+					gl.UNSIGNED_SHORT,
+					dc.start * 2
+				);
 			}
 
-			// depth test flags
-			if (dc.flags & 0x08)
-				ctx.set_depth_test(false);
-			else
-				ctx.set_depth_test(true);
+			// reset state
+			ctx.set_blend(false);
+			ctx.set_depth_test(true);
+			ctx.set_depth_write(true);
+			ctx.set_cull_face(false);
+		} else {
+			// WebGPU render path
+			// sort draw calls by blend mode (opaque first, then transparent)
+			const sorted_calls = [...this.draw_calls].sort((a, b) => {
+				const a_opaque = a.blend_mode === 0 || a.blend_mode === 1;
+				const b_opaque = b.blend_mode === 0 || b.blend_mode === 1;
+				if (a_opaque !== b_opaque)
+					return a_opaque ? -1 : 1;
 
-			// bind textures (up to 4 for multi-texture shaders)
-			for (let t = 0; t < 4; t++) {
-				const tex_idx = dc.tex_indices[t];
-				const texture = (tex_idx !== null) ? (this.textures.get(tex_idx) || this.default_texture) : this.default_texture;
-				texture.bind(t);
+				return 0;
+			});
+
+			pass.setPipeline(shader.pipeline);
+
+			for (const dc of sorted_calls) {
+				if (!dc.visible)
+					continue;
+
+				// set material uniforms
+				shader.set_uniform_1i('u_vertex_shader', dc.vertex_shader);
+				shader.set_uniform_1i('u_pixel_shader', dc.pixel_shader);
+				shader.set_uniform_1i('u_blend_mode', dc.blend_mode);
+
+				// mesh color (white for now)
+				shader.set_uniform_4f('u_mesh_color', 1, 1, 1, 1);
+
+				// flush uniforms and set bind group 0 (uniforms)
+				shader.flush_uniforms();
+				pass.setBindGroup(0, shader.uniform_bind_group);
+
+				// create and set texture bind group (group 1)
+				const tex_objs = [];
+				for (let t = 0; t < 4; t++) {
+					const tex_idx = dc.tex_indices[t];
+					const texture = (tex_idx !== null) ? (this.textures.get(tex_idx) || this.default_texture) : this.default_texture;
+					tex_objs.push(texture);
+				}
+
+				try {
+					const tex_bind_group = shader.create_texture_bind_group(tex_objs);
+					pass.setBindGroup(1, tex_bind_group);
+				} catch (e) {
+					// skip draw call if texture bind group creation fails
+					continue;
+				}
+
+				// bind vertex/index buffers and draw
+				dc.vao.bind_to_pass(pass);
+				pass.drawIndexed(dc.count, 1, dc.start, 0, 0);
 			}
-
-			// draw
-			dc.vao.bind();
-			gl.drawElements(
-				wireframe ? gl.LINES : gl.TRIANGLES,
-				dc.count,
-				gl.UNSIGNED_SHORT,
-				dc.start * 2
-			);
 		}
-
-		// reset state
-		ctx.set_blend(false);
-		ctx.set_depth_test(true);
-		ctx.set_depth_write(true);
-		ctx.set_cull_face(false);
 	}
 
 	/**
